@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.22)
 
 project(MusiqueEQ VERSION 0.1.0 LANGUAGES CXX)
 
+enable_testing()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -42,6 +44,9 @@ juce_add_plugin(MusiqueEQ
 juce_generate_juce_header(MusiqueEQ)
 
 target_sources(MusiqueEQ PRIVATE
+    Source/EQGraphMapping.h
+    Source/EQGraphUI.h
+    Source/EQPresetMigration.h
     Source/PluginEditor.cpp
     Source/PluginEditor.h
     Source/PluginProcessor.cpp
@@ -82,3 +87,41 @@ target_link_libraries(MusiqueEQ PRIVATE
     juce::juce_recommended_warning_flags
     juce::juce_recommended_lto_flags
 )
+
+juce_add_console_app(MusiqueEQDSPTests
+    PRODUCT_NAME "Musique EQ DSP Tests"
+)
+
+juce_generate_juce_header(MusiqueEQDSPTests)
+
+target_sources(MusiqueEQDSPTests PRIVATE
+    Tests/EQProcessorTests.cpp
+    Source/EQGraphMapping.h
+    Source/EQGraphUI.h
+    Source/EQPresetMigration.h
+    Source/PluginProcessor.cpp
+    Source/PluginProcessor.h
+)
+
+target_compile_definitions(MusiqueEQDSPTests PRIVATE
+    MUSIQUE_EQ_DSP_TESTS=1
+    JUCE_WEB_BROWSER=0
+    JUCE_USE_CURL=0
+    JUCE_VST3_CAN_REPLACE_VST2=0
+    JUCE_DISPLAY_SPLASH_SCREEN=0
+    JUCE_REPORT_APP_USAGE=0
+)
+
+target_include_directories(MusiqueEQDSPTests PRIVATE
+    Source
+)
+
+target_link_libraries(MusiqueEQDSPTests PRIVATE
+    FXShared
+    juce::juce_audio_utils
+    juce::juce_dsp
+    juce::juce_recommended_config_flags
+    juce::juce_recommended_warning_flags
+)
+
+add_test(NAME MusiqueEQDSPTests COMMAND MusiqueEQDSPTests)
