@@ -1,0 +1,13 @@
+{
+  "plugin": "Musique EQ",
+  "presets": [
+    {"name":"Master Neutral Stereo", "low_gain":0.0, "low_mid_gain":0.0, "mid_gain":0.0, "high_mid_gain":0.0, "high_gain":0.0, "q":1.0, "mix":100.0, "output":0.0, "mono":false},
+    {"name":"Air Lift Stereo", "low_gain":-1.0, "low_mid_gain":-0.5, "mid_gain":0.0, "high_mid_gain":1.5, "high_gain":3.0, "q":0.9, "mix":100.0, "output":-0.5, "mono":false},
+    {"name":"Vocal Presence Mono In", "low_gain":-2.0, "low_mid_gain":-1.5, "mid_gain":1.8, "high_mid_gain":2.6, "high_gain":1.2, "q":1.2, "mix":100.0, "output":-0.6, "mono":true},
+    {"name":"Bass Tightener Mono In", "low_gain":2.5, "low_mid_gain":-1.8, "mid_gain":-0.5, "high_mid_gain":0.4, "high_gain":0.8, "q":1.1, "mix":100.0, "output":-0.8, "mono":true},
+    {"name":"Lo-Fi Tilt Parallel", "low_gain":1.0, "low_mid_gain":0.8, "mid_gain":-1.2, "high_mid_gain":-2.0, "high_gain":-3.5, "q":0.8, "mix":85.0, "output":0.0, "mono":false},
+    {"name":"Drum Snap Focused", "low_gain":1.5, "low_mid_gain":-2.3, "mid_gain":0.9, "high_mid_gain":2.8, "high_gain":2.1, "q":1.4, "mix":100.0, "output":-1.0, "mono":false},
+    {"name":"Wide Smile Stereo", "low_gain":2.0, "low_mid_gain":-1.0, "mid_gain":-0.8, "high_mid_gain":1.7, "high_gain":2.4, "q":0.95, "mix":100.0, "output":-0.7, "mono":false},
+    {"name":"Parallel Tone Stereo", "low_gain":0.5, "low_mid_gain":-0.9, "mid_gain":0.6, "high_mid_gain":1.0, "high_gain":1.6, "q":1.1, "mix":68.0, "output":0.0, "mono":false}
+  ]
+}
