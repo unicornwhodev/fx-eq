@@ -36,7 +36,7 @@ juce_add_plugin(MusiqueEQ
     PLUGIN_MANUFACTURER_CODE MQFX
     PLUGIN_CODE MEQ1
     FORMATS Standalone VST3
-    PRODUCT_NAME "Musique EQ & Filter"
+    PRODUCT_NAME "Musique EQ and Filter"
     ICON_BIG   "${CMAKE_CURRENT_SOURCE_DIR}/Source/Assets/icon_big.png"
     ICON_SMALL "${CMAKE_CURRENT_SOURCE_DIR}/Source/Assets/icon_small.png"
 )

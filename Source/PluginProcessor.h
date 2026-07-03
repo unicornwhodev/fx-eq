@@ -22,7 +22,7 @@ public:
     const juce::String getName() const override
     {
 #if MUSIQUE_EQ_DSP_TESTS
-        return "Musique EQ & Filter";
+        return "Musique EQ and Filter";
 #else
         return JucePlugin_Name;
 #endif
