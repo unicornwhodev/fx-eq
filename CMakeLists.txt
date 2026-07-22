@@ -76,6 +76,7 @@ juce_add_binary_data(MusiqueEQAssets
         Source/Assets/icon_small.png
         Source/Assets/favicon.png
         Source/Assets/logo.png
+        Presets/factory_bank.json
 )
 
 target_link_libraries(MusiqueEQ PRIVATE
@@ -117,6 +118,7 @@ target_include_directories(MusiqueEQDSPTests PRIVATE
 )
 
 target_link_libraries(MusiqueEQDSPTests PRIVATE
+    MusiqueEQAssets
     FXShared
     juce::juce_audio_utils
     juce::juce_dsp

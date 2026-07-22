@@ -98,10 +98,10 @@ private:
     // Header
     juce::Label titleLabel;
     juce::Image pluginIcon, logoImg;
-    juce::TextButton bypassBtn{"Bypass"}, monoBtn{"STEREO IN"}, headroomBtn{"SAFE"}, settingsBtn{juce::CharPointer_UTF8("\xe2\x9a\x99")};
+    juce::TextButton bypassBtn{"Bypass"}, monoBtn{"STEREO IN"}, headroomBtn{"SAFE"};
 
     // Preset bar
-    juce::TextButton prevBtn{"<"}, nextBtn{">"}, saveBtn{"Save"}, abBtn{"A/B"};
+    juce::TextButton prevBtn{"<"}, nextBtn{">"}, saveBtn{"Save"};
     juce::ComboBox presetBox;
 
     // 6 knobs: Low, Lo-Mid, Mid, Hi-Mid, High, Q

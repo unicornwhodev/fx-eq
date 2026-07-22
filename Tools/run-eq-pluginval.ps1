@@ -1,25 +1,29 @@
 param(
-    [string] $DownloadRoot = "D:\tmp\pluginval",
+    [string] $DebugBuildRoot = '',
+    [string] $ReleaseBuildRoot = '',
     [int[]] $StrictnessLevels = @(5, 10)
 )
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = 'Stop'
 
-$repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
-$buildRoot = Resolve-Path (Join-Path $repoRoot "..\build")
-$logRoot = Join-Path $DownloadRoot "logs"
-$summaryPath = Join-Path $logRoot "eq-pluginval-summary.json"
+$repoRoot = Resolve-Path (Join-Path $PSScriptRoot '..\..')
+if ([string]::IsNullOrWhiteSpace($DebugBuildRoot)) {
+    $DebugBuildRoot = Join-Path $repoRoot 'build-codex-fx-suite-ninja'
+}
+if ([string]::IsNullOrWhiteSpace($ReleaseBuildRoot)) {
+    $ReleaseBuildRoot = Join-Path $repoRoot 'build-codex-fx-suite-ninja-release'
+}
 
-$plugins = @(
-    @{
-        Config = "Debug"
-        Path = Join-Path $buildRoot "fx-eq\MusiqueEQ_artefacts\Debug\VST3\Musique EQ & Filter.vst3"
-    },
-    @{
-        Config = "Release"
-        Path = Join-Path $buildRoot "fx-eq\MusiqueEQ_artefacts\Release\VST3\Musique EQ & Filter.vst3"
-    }
-)
+if (-not ($StrictnessLevels -contains 5)) {
+    throw 'Strictness level 5 is required because it is the blocking pluginval beta gate.'
+}
+
+$logRoot = Join-Path $repoRoot '.tools\pluginval\logs'
+$summaryPath = Join-Path $logRoot 'eq-pluginval-summary.json'
+
+function Resolve-FullPath([string] $Path) {
+    $executionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+}
 
 function Find-PluginvalExecutable {
     $pathCommand = Get-Command pluginval -ErrorAction SilentlyContinue
@@ -27,117 +31,91 @@ function Find-PluginvalExecutable {
         return $pathCommand.Source
     }
 
-    if (Test-Path $DownloadRoot) {
-        $downloaded = Get-ChildItem -LiteralPath $DownloadRoot -Recurse -Filter pluginval.exe -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-
-        if ($null -ne $downloaded) {
-            return $downloaded.FullName
+    $repoLocalDir = Join-Path $repoRoot '.tools\pluginval\bin'
+    $repoLocal = Join-Path $repoLocalDir 'pluginval.exe'
+    if (Test-Path -Path $repoLocal -PathType Leaf) {
+        $resolvedLocalDir = Resolve-FullPath $repoLocalDir
+        $pathEntries = @($env:PATH -split [IO.Path]::PathSeparator | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        if ($pathEntries -notcontains $resolvedLocalDir) {
+            $env:PATH = $resolvedLocalDir + [IO.Path]::PathSeparator + $env:PATH
         }
+
+        return (Resolve-FullPath $repoLocal)
     }
 
-    return $null
+    throw 'pluginval.exe was not found in PATH or .tools\pluginval\bin. Install pluginval before running this gate.'
 }
 
-function Install-Pluginval {
-    New-Item -ItemType Directory -Force -Path $DownloadRoot | Out-Null
+function New-PluginTarget {
+    param(
+        [string] $Config,
+        [string] $BuildRoot
+    )
 
-    $existing = Find-PluginvalExecutable
-    if ($null -ne $existing) {
-        return $existing
+    $resolvedBuildRoot = Resolve-FullPath $BuildRoot
+    $pluginPath = Join-Path $resolvedBuildRoot "fx-eq\MusiqueEQ_artefacts\$Config\VST3\Musique EQ and Filter.vst3"
+
+    [pscustomobject] @{
+        Config = $Config
+        BuildRoot = $resolvedBuildRoot
+        Path = $pluginPath
     }
-
-    $zipPath = Join-Path $DownloadRoot "pluginval_Windows.zip"
-    $extractPath = Join-Path $DownloadRoot "expanded"
-    $apiUrl = "https://api.github.com/repos/Tracktion/pluginval/releases/latest"
-    $fallbackUrl = "https://github.com/Tracktion/pluginval/releases/download/v1.0.4/pluginval_Windows.zip"
-    $downloadUrl = $fallbackUrl
-
-    try {
-        $release = Invoke-RestMethod -Uri $apiUrl -Headers @{ "User-Agent" = "MusiqueEQPluginvalGate" }
-        $asset = $release.assets |
-            Where-Object { $_.name -eq "pluginval_Windows.zip" -or $_.name -match "Windows.*\.zip$" } |
-            Select-Object -First 1
-
-        if ($null -ne $asset -and -not [string]::IsNullOrWhiteSpace($asset.browser_download_url)) {
-            $downloadUrl = $asset.browser_download_url
-        }
-    }
-    catch {
-        Write-Warning "Could not query latest pluginval release; falling back to v1.0.4 Windows asset. $($_.Exception.Message)"
-    }
-
-    Write-Host "Downloading pluginval from $downloadUrl"
-    Invoke-WebRequest -Uri $downloadUrl -OutFile $zipPath -Headers @{ "User-Agent" = "MusiqueEQPluginvalGate" }
-
-    if (Test-Path $extractPath) {
-        Remove-Item -LiteralPath $extractPath -Recurse -Force
-    }
-
-    New-Item -ItemType Directory -Force -Path $extractPath | Out-Null
-    Expand-Archive -LiteralPath $zipPath -DestinationPath $extractPath -Force
-
-    $executable = Get-ChildItem -LiteralPath $extractPath -Recurse -Filter pluginval.exe -ErrorAction Stop |
-        Select-Object -First 1
-
-    if ($null -eq $executable) {
-        throw "pluginval.exe was not found after extracting $zipPath"
-    }
-
-    return $executable.FullName
 }
 
 function Invoke-Pluginval {
     param(
         [string] $PluginvalExe,
-        [string] $Config,
-        [string] $PluginPath,
+        [pscustomobject] $Plugin,
         [int] $Strictness
     )
 
-    if (-not (Test-Path $PluginPath)) {
-        throw "Missing VST3 artifact for $Config`: $PluginPath"
+    if (-not (Test-Path -Path $Plugin.Path -PathType Container)) {
+        throw "Missing current VST3 artifact for $($Plugin.Config): $($Plugin.Path)"
     }
 
-    $logPath = Join-Path $logRoot ("pluginval-{0}-strictness-{1}.log" -f $Config.ToLowerInvariant(), $Strictness)
-    $arguments = @("--strictness-level", "$Strictness", $PluginPath)
+    $logPath = Join-Path $logRoot ("pluginval-{0}-strictness-{1}.log" -f $Plugin.Config.ToLowerInvariant(), $Strictness)
+    $arguments = @('--strictness-level', "$Strictness", $Plugin.Path)
     Write-Host "Running: `"$PluginvalExe`" $($arguments -join ' ')"
 
     $output = @(& $PluginvalExe @arguments 2>&1)
     $exitCode = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 0 }
     $logLines = @(
         "Command: `"$PluginvalExe`" $($arguments -join ' ')",
-        "Config: $Config",
+        "Config: $($Plugin.Config)",
         "Strictness: $Strictness",
-        "Plugin: $PluginPath",
+        "BuildRoot: $($Plugin.BuildRoot)",
+        "Plugin: $($Plugin.Path)",
         "ExitCode: $exitCode",
-        "",
-        "Output:"
+        '',
+        'Output:'
     ) + $output
 
     $logLines | Set-Content -LiteralPath $logPath
 
-    $tail = @($logLines | Select-Object -Last 30)
-
-    return [pscustomobject] @{
-        Config = $Config
+    [pscustomobject] @{
+        Config = $Plugin.Config
         Strictness = $Strictness
-        PluginPath = $PluginPath
+        BuildRoot = $Plugin.BuildRoot
+        PluginPath = $Plugin.Path
         ExitCode = $exitCode
         Passed = ($exitCode -eq 0)
         LogPath = $logPath
-        Tail = $tail
+        Tail = @($logLines | Select-Object -Last 30)
     }
 }
 
 New-Item -ItemType Directory -Force -Path $logRoot | Out-Null
 
-$pluginvalExe = Install-Pluginval
+$pluginvalExe = Find-PluginvalExecutable
+$plugins = @(
+    New-PluginTarget -Config 'Debug' -BuildRoot $DebugBuildRoot
+    New-PluginTarget -Config 'Release' -BuildRoot $ReleaseBuildRoot
+)
+
 $results = @()
 $strictness5Passed = $true
-
 foreach ($plugin in $plugins) {
-    $result = Invoke-Pluginval -PluginvalExe $pluginvalExe -Config $plugin.Config -PluginPath $plugin.Path -Strictness 5
+    $result = Invoke-Pluginval -PluginvalExe $pluginvalExe -Plugin $plugin -Strictness 5
     $results += $result
     if (-not $result.Passed) {
         $strictness5Passed = $false
@@ -146,12 +124,12 @@ foreach ($plugin in $plugins) {
 
 if ($strictness5Passed -and ($StrictnessLevels -contains 10)) {
     foreach ($plugin in $plugins) {
-        $results += Invoke-Pluginval -PluginvalExe $pluginvalExe -Config $plugin.Config -PluginPath $plugin.Path -Strictness 10
+        $results += Invoke-Pluginval -PluginvalExe $pluginvalExe -Plugin $plugin -Strictness 10
     }
 }
 
 $summary = [pscustomobject] @{
-    Timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss zzz")
+    Timestamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss zzz')
     Pluginval = $pluginvalExe
     BlockingStrictness = 5
     BlockingPassed = $strictness5Passed
@@ -162,8 +140,8 @@ $summary | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $summaryPath
 
 Write-Host "Summary: $summaryPath"
 foreach ($result in $results) {
-    $status = if ($result.Passed) { "PASS" } else { "FAIL" }
-    Write-Host ("{0} strictness {1}: {2} (exit {3})" -f $result.Config, $result.Strictness, $status, $result.ExitCode)
+    $status = if ($result.Passed) { 'PASS' } else { 'FAIL' }
+    Write-Host ('{0} strictness {1}: {2} (exit {3})' -f $result.Config, $result.Strictness, $status, $result.ExitCode)
 }
 
 if (-not $strictness5Passed) {

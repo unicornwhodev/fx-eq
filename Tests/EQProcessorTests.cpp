@@ -2,9 +2,13 @@
 #include "EQGraphMapping.h"
 #include "EQGraphUI.h"
 #include "EQPresetMigration.h"
+#include "BinaryData.h"
 
+#include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
@@ -26,6 +30,21 @@ constexpr std::array<float, 5> legacyFrequencyDefaults {{
 constexpr std::array<const char*, 6> cutFilterParamIds {{
     "hpf_enabled", "hpf_freq", "hpf_slope", "lpf_enabled", "lpf_freq", "lpf_slope"
 }};
+
+struct GoldenAudioSignature
+{
+    int version = 1;
+    double sampleRate = 48000.0;
+    int blockSize = 256;
+    int frames = 4096;
+    std::vector<int> tapIndices;
+    std::vector<float> leftTaps;
+    std::vector<float> rightTaps;
+    float rmsLeft = 0.0f;
+    float rmsRight = 0.0f;
+    float peak = 0.0f;
+    float trimDb = 0.0f;
+};
 
 struct Runner
 {
@@ -219,6 +238,46 @@ void process(MusiqueEQProcessor& processor, juce::AudioBuffer<float>& buffer)
     processor.processBlock(buffer, midi);
 }
 
+void processInBlocks(MusiqueEQProcessor& processor, juce::AudioBuffer<float>& buffer, int blockSize)
+{
+    int offset = 0;
+    while (offset < buffer.getNumSamples())
+    {
+        const int numSamples = juce::jmin(blockSize, buffer.getNumSamples() - offset);
+        juce::AudioBuffer<float> block(buffer.getNumChannels(), numSamples);
+        for (int channel = 0; channel < buffer.getNumChannels(); ++channel)
+            block.copyFrom(channel, 0, buffer, channel, offset, numSamples);
+
+        process(processor, block);
+
+        for (int channel = 0; channel < buffer.getNumChannels(); ++channel)
+            buffer.copyFrom(channel, offset, block, channel, 0, numSamples);
+
+        offset += numSamples;
+    }
+}
+
+void settleSmoothing(MusiqueEQProcessor& processor, int blocks = 80, int blockSize = 64)
+{
+    for (int i = 0; i < blocks; ++i)
+    {
+        juce::AudioBuffer<float> buffer(2, blockSize);
+        buffer.clear();
+        process(processor, buffer);
+    }
+}
+
+juce::AudioBuffer<float> makeImpulse(int samples, int channels = 2)
+{
+    juce::AudioBuffer<float> buffer(channels, samples);
+    buffer.clear();
+
+    for (int channel = 0; channel < channels; ++channel)
+        buffer.setSample(channel, 0, 1.0f);
+
+    return buffer;
+}
+
 float maxAbs(const juce::AudioBuffer<float>& buffer)
 {
     float out = 0.0f;
@@ -249,6 +308,15 @@ float maxChannelDiff(const juce::AudioBuffer<float>& buffer)
     return out;
 }
 
+float maxAdjacentDiff(const juce::AudioBuffer<float>& buffer)
+{
+    float out = 0.0f;
+    for (int channel = 0; channel < buffer.getNumChannels(); ++channel)
+        for (int sample = 1; sample < buffer.getNumSamples(); ++sample)
+            out = juce::jmax(out, std::abs(buffer.getSample(channel, sample) - buffer.getSample(channel, sample - 1)));
+    return out;
+}
+
 float rmsFrom(const juce::AudioBuffer<float>& buffer, int startSample)
 {
     double sum = 0.0;
@@ -267,6 +335,31 @@ float rmsFrom(const juce::AudioBuffer<float>& buffer, int startSample)
     return count > 0 ? static_cast<float>(std::sqrt(sum / static_cast<double>(count))) : 0.0f;
 }
 
+float channelRms(const juce::AudioBuffer<float>& buffer, int channel)
+{
+    if (channel < 0 || channel >= buffer.getNumChannels() || buffer.getNumSamples() <= 0)
+        return 0.0f;
+
+    double sum = 0.0;
+    for (int sample = 0; sample < buffer.getNumSamples(); ++sample)
+    {
+        const double value = buffer.getSample(channel, sample);
+        sum += value * value;
+    }
+
+    return static_cast<float>(std::sqrt(sum / static_cast<double>(buffer.getNumSamples())));
+}
+
+int firstSignificantSample(const juce::AudioBuffer<float>& buffer, float threshold = 1.0e-6f)
+{
+    for (int sample = 0; sample < buffer.getNumSamples(); ++sample)
+        for (int channel = 0; channel < buffer.getNumChannels(); ++channel)
+            if (std::abs(buffer.getSample(channel, sample)) >= threshold)
+                return sample;
+
+    return -1;
+}
+
 bool allFinite(const juce::AudioBuffer<float>& buffer)
 {
     for (int channel = 0; channel < buffer.getNumChannels(); ++channel)
@@ -277,6 +370,54 @@ bool allFinite(const juce::AudioBuffer<float>& buffer)
     return true;
 }
 
+juce::AudioBuffer<float> renderImpulseResponse(MusiqueEQProcessor& processor, double sampleRate)
+{
+    constexpr int fftOrder = 14;
+    constexpr int fftSize = 1 << fftOrder;
+    prepare(processor, sampleRate, fftSize);
+
+    auto buffer = makeImpulse(fftSize, 2);
+    process(processor, buffer);
+    return buffer;
+}
+
+float fftMagnitudeDbAt(const juce::AudioBuffer<float>& impulseResponse, double sampleRate, double frequency)
+{
+    constexpr int fftOrder = 14;
+    constexpr int fftSize = 1 << fftOrder;
+    juce::dsp::FFT fft(fftOrder);
+    std::vector<float> fftData(static_cast<size_t>(fftSize * 2), 0.0f);
+
+    const int samples = juce::jmin(fftSize, impulseResponse.getNumSamples());
+    for (int sample = 0; sample < samples; ++sample)
+        fftData[(size_t) sample] = impulseResponse.getSample(0, sample);
+
+    fft.performFrequencyOnlyForwardTransform(fftData.data(), true);
+
+    const auto maxBin = fftSize / 2;
+    const int bin = juce::jlimit(1, maxBin - 1, static_cast<int>(std::round(frequency * fftSize / sampleRate)));
+    const auto magnitude = juce::jmax(fftData[(size_t) bin], 1.0e-8f);
+    return juce::Decibels::gainToDecibels(magnitude, -160.0f);
+}
+
+bool coefficientsFinite(const MusiqueEQProcessor::TestBiquadCoefficients& coefficients)
+{
+    return std::all_of(coefficients.begin(), coefficients.end(), [](float value)
+    {
+        return std::isfinite(value);
+    });
+}
+
+float coefficientDistance(const MusiqueEQProcessor::TestBiquadCoefficients& a,
+                          const MusiqueEQProcessor::TestBiquadCoefficients& b)
+{
+    float distance = 0.0f;
+    for (size_t i = 0; i < a.size(); ++i)
+        distance += std::abs(a[i] - b[i]);
+
+    return distance;
+}
+
 void expectNearBuffer(Runner& runner,
                       const juce::AudioBuffer<float>& actual,
                       const juce::AudioBuffer<float>& expected,
@@ -285,6 +426,18 @@ void expectNearBuffer(Runner& runner,
 {
     const auto diff = maxAbsDiff(actual, expected);
     runner.expect(diff <= tolerance, name + " (max diff " + std::to_string(diff) + ")");
+}
+
+void expectInRange(Runner& runner,
+                   float actual,
+                   float minValue,
+                   float maxValue,
+                   const std::string& name)
+{
+    runner.expect(actual >= minValue && actual <= maxValue,
+                  name + " (actual " + std::to_string(actual)
+                      + ", range " + std::to_string(minValue)
+                      + ".." + std::to_string(maxValue) + ")");
 }
 
 void expectParameterNear(Runner& runner,
@@ -388,6 +541,172 @@ juce::Array<juce::var> loadFactoryPresetsForTests(Runner& runner)
         presets.addArray(*presetArray);
 
     return presets;
+}
+
+juce::File findGoldenReferenceForTests()
+{
+    auto dir = juce::File::getCurrentWorkingDirectory();
+
+    for (int i = 0; i < 12; ++i)
+    {
+        const std::array<juce::File, 3> candidates {{
+            dir.getChildFile("Tests").getChildFile("golden").getChildFile("eq_reference_48k_stereo.json"),
+            dir.getChildFile("fx-eq").getChildFile("Tests").getChildFile("golden").getChildFile("eq_reference_48k_stereo.json"),
+            dir.getChildFile("FX").getChildFile("fx-eq").getChildFile("Tests").getChildFile("golden").getChildFile("eq_reference_48k_stereo.json")
+        }};
+
+        for (const auto& candidate : candidates)
+            if (candidate.existsAsFile())
+                return candidate;
+
+        const auto parent = dir.getParentDirectory();
+        if (parent == dir)
+            break;
+
+        dir = parent;
+    }
+
+    return {};
+}
+
+void configureGoldenParameters(MusiqueEQProcessor& processor)
+{
+    setParameter(processor, "low_gain", 3.0f);
+    setParameter(processor, "low_mid_gain", -2.0f);
+    setParameter(processor, "mid_gain", 4.0f);
+    setParameter(processor, "high_mid_gain", -1.5f);
+    setParameter(processor, "high_gain", 2.0f);
+    setParameter(processor, "q", 1.8f);
+    setParameter(processor, "low_freq", 90.0f);
+    setParameter(processor, "low_mid_freq", 420.0f);
+    setParameter(processor, "mid_freq", 1800.0f);
+    setParameter(processor, "high_mid_freq", 6200.0f);
+    setParameter(processor, "high_freq", 12000.0f);
+    setParameter(processor, "hpf_enabled", 1.0f);
+    setParameter(processor, "hpf_freq", 45.0f);
+    setParameter(processor, "hpf_slope", 24.0f);
+    setParameter(processor, "lpf_enabled", 1.0f);
+    setParameter(processor, "lpf_freq", 17500.0f);
+    setParameter(processor, "lpf_slope", 24.0f);
+    setParameter(processor, "mix", 100.0f);
+    setParameter(processor, "output", -1.0f);
+    setParameter(processor, "bypass", 0.0f);
+    setParameter(processor, "mono", 0.0f);
+}
+
+GoldenAudioSignature renderGoldenAudioSignature()
+{
+    GoldenAudioSignature signature;
+    signature.tapIndices = { 0, 1, 2, 3, 4, 7, 16, 31, 64, 127, 255, 511, 1023, 2047, 3071, 4095 };
+
+    MusiqueEQProcessor processor;
+    configureGoldenParameters(processor);
+    prepare(processor, signature.sampleRate, signature.blockSize);
+
+    auto buffer = makeBroadbandProbe(signature.frames, signature.sampleRate, 0.014f);
+    processInBlocks(processor, buffer, signature.blockSize);
+
+    signature.leftTaps.reserve(signature.tapIndices.size());
+    signature.rightTaps.reserve(signature.tapIndices.size());
+    for (int index : signature.tapIndices)
+    {
+        signature.leftTaps.push_back(buffer.getSample(0, index));
+        signature.rightTaps.push_back(buffer.getSample(1, index));
+    }
+
+    signature.rmsLeft = channelRms(buffer, 0);
+    signature.rmsRight = channelRms(buffer, 1);
+    signature.peak = maxAbs(buffer);
+    signature.trimDb = processor.getCurrentInternalTrimDb();
+    return signature;
+}
+
+template <typename Value>
+juce::var vectorToJsonArray(const std::vector<Value>& values)
+{
+    juce::Array<juce::var> array;
+    for (const auto value : values)
+        array.add(juce::var(value));
+
+    return juce::var(array);
+}
+
+juce::var goldenToJson(const GoldenAudioSignature& signature)
+{
+    auto* root = new juce::DynamicObject();
+    root->setProperty("version", signature.version);
+    root->setProperty("sampleRate", signature.sampleRate);
+    root->setProperty("blockSize", signature.blockSize);
+    root->setProperty("frames", signature.frames);
+    root->setProperty("tapIndices", vectorToJsonArray(signature.tapIndices));
+    root->setProperty("tapsL", vectorToJsonArray(signature.leftTaps));
+    root->setProperty("tapsR", vectorToJsonArray(signature.rightTaps));
+    root->setProperty("rmsL", signature.rmsLeft);
+    root->setProperty("rmsR", signature.rmsRight);
+    root->setProperty("peak", signature.peak);
+    root->setProperty("trimDb", signature.trimDb);
+    return juce::var(root);
+}
+
+bool readIntVector(const juce::var& value, std::vector<int>& out)
+{
+    auto* array = value.getArray();
+    if (array == nullptr)
+        return false;
+
+    out.clear();
+    out.reserve(static_cast<size_t>(array->size()));
+    for (int i = 0; i < array->size(); ++i)
+        out.push_back(static_cast<int>(array->getReference(i)));
+
+    return true;
+}
+
+bool readFloatVector(const juce::var& value, std::vector<float>& out)
+{
+    auto* array = value.getArray();
+    if (array == nullptr)
+        return false;
+
+    out.clear();
+    out.reserve(static_cast<size_t>(array->size()));
+    for (int i = 0; i < array->size(); ++i)
+        out.push_back(static_cast<float>(array->getReference(i)));
+
+    return true;
+}
+
+bool loadGoldenAudioSignature(const juce::File& file, GoldenAudioSignature& signature)
+{
+    const auto parsed = juce::JSON::parse(file.loadFileAsString());
+    auto* object = parsed.getDynamicObject();
+    if (object == nullptr)
+        return false;
+
+    signature.version = static_cast<int>(object->getProperty("version"));
+    signature.sampleRate = static_cast<double>(object->getProperty("sampleRate"));
+    signature.blockSize = static_cast<int>(object->getProperty("blockSize"));
+    signature.frames = static_cast<int>(object->getProperty("frames"));
+    signature.rmsLeft = static_cast<float>(object->getProperty("rmsL"));
+    signature.rmsRight = static_cast<float>(object->getProperty("rmsR"));
+    signature.peak = static_cast<float>(object->getProperty("peak"));
+    signature.trimDb = static_cast<float>(object->getProperty("trimDb"));
+
+    return signature.version == 1
+        && readIntVector(object->getProperty("tapIndices"), signature.tapIndices)
+        && readFloatVector(object->getProperty("tapsL"), signature.leftTaps)
+        && readFloatVector(object->getProperty("tapsR"), signature.rightTaps)
+        && signature.tapIndices.size() == signature.leftTaps.size()
+        && signature.tapIndices.size() == signature.rightTaps.size();
+}
+
+bool writeGoldenAudioReference(const juce::File& outputFile)
+{
+    if (! outputFile.getParentDirectory().createDirectory())
+        return false;
+
+    const auto signature = renderGoldenAudioSignature();
+    return outputFile.replaceWithText(juce::JSON::toString(goldenToJson(signature)));
 }
 
 void testGraphMappingHelpers(Runner& runner)
@@ -500,24 +819,89 @@ void testPresetMigrationHelper(Runner& runner)
     expectObjectFloatNear(runner, object, "lpf_enabled", 0.0f, 0.001f, "legacy preset migration fills LPF disabled");
     expectObjectFloatNear(runner, object, "lpf_freq", 18000.0f, 0.01f, "legacy preset migration fills LPF frequency");
     expectObjectFloatNear(runner, object, "lpf_slope", 12.0f, 0.001f, "legacy preset migration fills LPF slope");
+    for (auto* id : musique::eq::presets::futureBandQParamIds)
+        expectObjectFloatNear(runner, object, id, 1.2f, 0.001f,
+                              std::string("legacy preset migration fills future band Q ") + id);
     runner.expect(! object->hasProperty("bypass"), "legacy preset migration does not synthesize bypass");
     runner.expect(! legacy->hasProperty("low_freq"), "legacy preset migration leaves source preset unchanged");
+
+    auto makeFutureQVariant = [](float futureQ)
+    {
+        juce::DynamicObject::Ptr preset = new juce::DynamicObject();
+        preset->setProperty("name", "Future Q Compatibility");
+        preset->setProperty("low_gain", 1.0f);
+        preset->setProperty("low_mid_gain", -0.5f);
+        preset->setProperty("mid_gain", 2.0f);
+        preset->setProperty("high_mid_gain", -0.75f);
+        preset->setProperty("high_gain", 0.8f);
+        preset->setProperty("low_freq", 90.0f);
+        preset->setProperty("low_mid_freq", 360.0f);
+        preset->setProperty("mid_freq", 1800.0f);
+        preset->setProperty("high_mid_freq", 6200.0f);
+        preset->setProperty("high_freq", 12000.0f);
+        preset->setProperty("q", 1.4f);
+        preset->setProperty("mix", 100.0f);
+        preset->setProperty("output", -1.0f);
+        preset->setProperty("bypass", false);
+        preset->setProperty("mono", false);
+        preset->setProperty("hpf_enabled", true);
+        preset->setProperty("hpf_freq", 35.0f);
+        preset->setProperty("hpf_slope", 24.0f);
+        preset->setProperty("lpf_enabled", true);
+        preset->setProperty("lpf_freq", 17000.0f);
+        preset->setProperty("lpf_slope", 12.0f);
+
+        for (auto* id : musique::eq::presets::futureBandQParamIds)
+            preset->setProperty(id, futureQ);
+
+        return juce::var(preset.get());
+    };
+
+    MusiqueEQProcessor lowFutureQ;
+    MusiqueEQProcessor highFutureQ;
+    applyPresetToProcessor(lowFutureQ, makeFutureQVariant(0.3f));
+    applyPresetToProcessor(highFutureQ, makeFutureQVariant(8.0f));
+    prepare(lowFutureQ, 48000.0, 1024);
+    prepare(highFutureQ, 48000.0, 1024);
+
+    auto lowFutureQBuffer = makeBroadbandProbe(1024, 48000.0, 0.015f);
+    auto highFutureQBuffer = copyOf(lowFutureQBuffer);
+    process(lowFutureQ, lowFutureQBuffer);
+    process(highFutureQ, highFutureQBuffer);
+    expectNearBuffer(runner, lowFutureQBuffer, highFutureQBuffer, 1.0e-7f,
+                     "future per-band Q metadata is ignored until public parameters exist");
 }
 
 void testFactoryPresetBank(Runner& runner)
 {
     const auto presets = loadFactoryPresetsForTests(runner);
-    runner.expect(presets.size() == 8, "factory preset bank contains exactly 8 beta presets");
+    runner.expect(presets.size() == 24, "factory preset bank contains exactly 24 public beta presets");
 
-    const std::array<const char*, 8> expectedNames {{
+    const std::array<const char*, 24> expectedNames {{
         "Master Clean Reference",
-        "Master Air Lift",
-        "Master Tight Low End",
-        "Master Warm Tilt",
-        "Master Presence Control",
+        "Master Clean Open",
+        "Master Clean Warm",
+        "Master Corrective Mud Control",
+        "Master Corrective Harshness Tamer",
+        "Master Corrective Rumble Guard",
         "Mix Bus Smile",
+        "Mix Bus Glue",
+        "Mix Bus Punch",
         "Streaming Safe Bright",
-        "Band Limited Preview"
+        "Streaming Loudness Guard",
+        "Streaming Dark Source Lift",
+        "Band Limited Preview",
+        "Band Limit Phone Check",
+        "Band Limit Club PA",
+        "Vocal Clear Lead",
+        "Vocal Warm Lead",
+        "Vocal Sibilance Tamer",
+        "Drum Bus Punch",
+        "Drum Overhead Air",
+        "Low End Tight Bass",
+        "Low End Sub Control",
+        "Air Lift Smooth",
+        "Repair Thin Source"
     }};
 
     const auto count = juce::jmin(presets.size(), static_cast<int>(expectedNames.size()));
@@ -536,6 +920,18 @@ void testFactoryPresetBank(Runner& runner)
         for (auto* id : musique::eq::presets::requiredPresetParameterIds)
             runner.expect(object->hasProperty(id), "factory preset " + presetName.toStdString() + " includes " + id);
 
+        const float qValue = static_cast<float>(object->getProperty("q"));
+        for (auto* id : musique::eq::presets::futureBandQParamIds)
+            expectObjectFloatNear(runner, object, id, qValue, 0.001f,
+                                  "factory preset " + presetName.toStdString() + " future " + id + " mirrors global Q");
+
+        runner.expect(static_cast<bool>(object->getProperty("bypass")) == false,
+                      "factory preset " + presetName.toStdString() + " keeps bypass disabled");
+        runner.expect(static_cast<bool>(object->getProperty("mono")) == false,
+                      "factory preset " + presetName.toStdString() + " keeps mono disabled");
+        runner.expect(static_cast<float>(object->getProperty("output")) <= 0.001f,
+                      "factory preset " + presetName.toStdString() + " does not boost output");
+
         MusiqueEQProcessor processor;
         applyPresetToProcessor(processor, presets.getReference(i));
         prepare(processor, 48000.0, 1024);
@@ -546,6 +942,26 @@ void testFactoryPresetBank(Runner& runner)
         runner.expect(allFinite(buffer), "factory preset " + presetName.toStdString() + " processing stays finite");
         runner.expect(maxAbs(buffer) < 512.0f, "factory preset " + presetName.toStdString() + " processing stays bounded");
     }
+}
+
+void testEmbeddedFactoryPresetBank(Runner& runner)
+{
+    runner.expect(BinaryData::factory_bank_jsonSize > 0, "embedded factory preset bank is non-empty");
+
+    const auto jsonText = juce::String::fromUTF8(
+        reinterpret_cast<const char*>(BinaryData::factory_bank_json),
+        BinaryData::factory_bank_jsonSize);
+    const auto parsed = juce::JSON::parse(jsonText);
+    auto* bank = parsed.getDynamicObject();
+    runner.expect(bank != nullptr, "embedded factory preset bank parses as JSON object");
+
+    if (bank == nullptr)
+        return;
+
+    auto* presetArray = bank->getProperty("presets").getArray();
+    runner.expect(presetArray != nullptr, "embedded factory preset bank contains presets array");
+    runner.expect(presetArray != nullptr && presetArray->size() == 24,
+                  "embedded factory preset bank contains exactly 24 public beta presets");
 }
 
 void testNeutrality(Runner& runner)
@@ -1023,6 +1439,270 @@ void testCutFilters(Runner& runner)
     }
 }
 
+void testImpulseFftFrequencyResponse(Runner& runner)
+{
+    constexpr double sampleRate = 48000.0;
+
+    {
+        MusiqueEQProcessor processor;
+        const auto response = renderImpulseResponse(processor, sampleRate);
+        expectInRange(runner, fftMagnitudeDbAt(response, sampleRate, 60.0), -0.15f, 0.15f,
+                      "FFT impulse neutral response is flat at 60 Hz");
+        expectInRange(runner, fftMagnitudeDbAt(response, sampleRate, 1000.0), -0.15f, 0.15f,
+                      "FFT impulse neutral response is flat at 1 kHz");
+        expectInRange(runner, fftMagnitudeDbAt(response, sampleRate, 12000.0), -0.15f, 0.15f,
+                      "FFT impulse neutral response is flat at 12 kHz");
+    }
+
+    {
+        MusiqueEQProcessor processor;
+        setParameter(processor, "mid_gain", 6.0f);
+        setParameter(processor, "mid_freq", 1200.0f);
+        setParameter(processor, "q", 1.2f);
+        const auto response = renderImpulseResponse(processor, sampleRate);
+
+        expectInRange(runner, fftMagnitudeDbAt(response, sampleRate, 1200.0), 5.0f, 7.5f,
+                      "FFT impulse bell +6 dB near 1200 Hz reaches target range");
+        expectInRange(runner, fftMagnitudeDbAt(response, sampleRate, 120.0), -0.75f, 0.75f,
+                      "FFT impulse bell +6 dB leaves low edge near unity");
+        expectInRange(runner, fftMagnitudeDbAt(response, sampleRate, 12000.0), -0.75f, 0.75f,
+                      "FFT impulse bell +6 dB leaves high edge near unity");
+    }
+
+    {
+        MusiqueEQProcessor processor;
+        setParameter(processor, "low_gain", 6.0f);
+        setParameter(processor, "low_freq", 100.0f);
+        setParameter(processor, "q", 1.0f);
+        const auto response = renderImpulseResponse(processor, sampleRate);
+
+        expectInRange(runner, fftMagnitudeDbAt(response, sampleRate, 50.0), 4.5f, 7.5f,
+                      "FFT impulse low shelf +6 dB boosts 50 Hz");
+        expectInRange(runner, fftMagnitudeDbAt(response, sampleRate, 2000.0), -0.75f, 0.75f,
+                      "FFT impulse low shelf +6 dB leaves 2 kHz near unity");
+    }
+
+    {
+        MusiqueEQProcessor processor;
+        setParameter(processor, "hpf_enabled", 1.0f);
+        setParameter(processor, "hpf_freq", 300.0f);
+        setParameter(processor, "hpf_slope", 48.0f);
+        const auto response = renderImpulseResponse(processor, sampleRate);
+
+        runner.expect(fftMagnitudeDbAt(response, sampleRate, 60.0) <= -40.0f,
+                      "FFT impulse HPF 48 dB/oct at 300 Hz attenuates 60 Hz by at least 40 dB");
+        expectInRange(runner, fftMagnitudeDbAt(response, sampleRate, 1000.0), -1.0f, 1.0f,
+                      "FFT impulse HPF 48 dB/oct at 300 Hz preserves 1 kHz near unity");
+    }
+
+    {
+        MusiqueEQProcessor processor;
+        setParameter(processor, "lpf_enabled", 1.0f);
+        setParameter(processor, "lpf_freq", 3000.0f);
+        setParameter(processor, "lpf_slope", 48.0f);
+        const auto response = renderImpulseResponse(processor, sampleRate);
+
+        runner.expect(fftMagnitudeDbAt(response, sampleRate, 12000.0) <= -40.0f,
+                      "FFT impulse LPF 48 dB/oct at 3 kHz attenuates 12 kHz by at least 40 dB");
+        expectInRange(runner, fftMagnitudeDbAt(response, sampleRate, 500.0), -1.0f, 1.0f,
+                      "FFT impulse LPF 48 dB/oct at 3 kHz preserves 500 Hz near unity");
+    }
+}
+
+void testLatencyAndImpulsePosition(Runner& runner)
+{
+    {
+        MusiqueEQProcessor processor;
+        runner.expect(processor.getLatencySamples() == 0, "reported plugin latency is zero samples");
+
+        const auto response = renderImpulseResponse(processor, 48000.0);
+        runner.expect(firstSignificantSample(response) == 0,
+                      "neutral impulse first significant sample stays at index 0");
+        runner.expect(std::abs(response.getSample(0, 0) - 1.0f) <= 1.0e-5f
+                        && std::abs(response.getSample(1, 0) - 1.0f) <= 1.0e-5f,
+                      "neutral impulse preserves sample 0 amplitude");
+    }
+
+    {
+        MusiqueEQProcessor processor;
+        setParameter(processor, "bypass", 1.0f);
+
+        const auto response = renderImpulseResponse(processor, 48000.0);
+        runner.expect(firstSignificantSample(response) == 0,
+                      "bypass impulse first significant sample stays at index 0");
+        runner.expect(std::abs(response.getSample(0, 0) - 1.0f) <= 1.0e-5f
+                        && std::abs(response.getSample(1, 0) - 1.0f) <= 1.0e-5f,
+                      "bypass impulse preserves sample 0 amplitude");
+    }
+
+    {
+        MusiqueEQProcessor processor;
+        setParameter(processor, "mid_gain", 6.0f);
+        setParameter(processor, "mid_freq", 1200.0f);
+        setParameter(processor, "q", 2.0f);
+        setParameter(processor, "hpf_enabled", 1.0f);
+        setParameter(processor, "hpf_freq", 300.0f);
+        setParameter(processor, "hpf_slope", 24.0f);
+        setParameter(processor, "lpf_enabled", 1.0f);
+        setParameter(processor, "lpf_freq", 6000.0f);
+        setParameter(processor, "lpf_slope", 24.0f);
+
+        const auto response = renderImpulseResponse(processor, 48000.0);
+        runner.expect(firstSignificantSample(response) == 0,
+                      "EQ plus HPF/LPF impulse has no pre-delay before sample 0");
+        runner.expect(allFinite(response), "EQ plus HPF/LPF impulse response stays finite");
+    }
+}
+
+void testSampleRateChangeStability(Runner& runner)
+{
+    MusiqueEQProcessor processor;
+    setParameter(processor, "low_gain", 18.0f);
+    setParameter(processor, "low_mid_gain", -18.0f);
+    setParameter(processor, "mid_gain", 24.0f);
+    setParameter(processor, "high_mid_gain", -21.0f);
+    setParameter(processor, "high_gain", 15.0f);
+    setParameter(processor, "q", 7.5f);
+    setParameter(processor, "low_freq", 40.0f);
+    setParameter(processor, "low_mid_freq", 180.0f);
+    setParameter(processor, "mid_freq", 2200.0f);
+    setParameter(processor, "high_mid_freq", 9000.0f);
+    setParameter(processor, "high_freq", 18000.0f);
+    setParameter(processor, "hpf_enabled", 1.0f);
+    setParameter(processor, "hpf_freq", 30.0f);
+    setParameter(processor, "hpf_slope", 48.0f);
+    setParameter(processor, "lpf_enabled", 1.0f);
+    setParameter(processor, "lpf_freq", 18000.0f);
+    setParameter(processor, "lpf_slope", 48.0f);
+
+    const std::array<double, 4> sampleRates {{ 44100.0, 96000.0, 12000.0, 192000.0 }};
+    const std::array<int, 4> blockSizes {{ 257, 512, 129, 1024 }};
+
+    for (size_t i = 0; i < sampleRates.size(); ++i)
+    {
+        const auto sampleRate = sampleRates[i];
+        const auto blockSize = blockSizes[i];
+        prepare(processor, sampleRate, blockSize);
+
+        bool finite = true;
+        float peak = 0.0f;
+        for (int block = 0; block < 24; ++block)
+        {
+            auto buffer = makeBroadbandProbe(blockSize, sampleRate, 0.006f);
+            process(processor, buffer);
+            finite = finite && allFinite(buffer);
+            peak = juce::jmax(peak, maxAbs(buffer));
+        }
+
+        const std::string suffix = " at " + std::to_string(static_cast<int>(sampleRate)) + " Hz";
+        runner.expect(std::abs(processor.getPreparedSampleRate() - sampleRate) <= 1.0e-6,
+                      "sample-rate change updates prepared sample rate" + suffix);
+        runner.expect(finite, "sample-rate change aggressive processing stays finite" + suffix);
+        runner.expect(peak < 64.0f, "sample-rate change aggressive processing stays bounded" + suffix
+                                + " (peak " + std::to_string(peak) + ")");
+        runner.expect(processor.getCurrentInternalTrimDb() <= 12.01f,
+                      "sample-rate change internal trim remains capped" + suffix);
+    }
+}
+
+void testExtremeCoefficientMovement(Runner& runner)
+{
+    MusiqueEQProcessor processor;
+    setParameter(processor, "mid_freq", 1200.0f);
+    prepare(processor, 48000.0, 64);
+    const auto neutral = processor.getTestCoefficientSnapshots();
+
+    setParameter(processor, "mid_gain", 24.0f);
+    settleSmoothing(processor);
+    const auto plusGain = processor.getTestCoefficientSnapshots();
+
+    setParameter(processor, "mid_gain", -24.0f);
+    settleSmoothing(processor);
+    const auto minusGain = processor.getTestCoefficientSnapshots();
+
+    setParameter(processor, "mid_gain", 12.0f);
+    setParameter(processor, "q", 0.3f);
+    settleSmoothing(processor);
+    const auto wideQ = processor.getTestCoefficientSnapshots();
+
+    setParameter(processor, "q", 8.0f);
+    settleSmoothing(processor);
+    const auto narrowQ = processor.getTestCoefficientSnapshots();
+
+    runner.expect(coefficientsFinite(neutral.eq[2])
+                    && coefficientsFinite(plusGain.eq[2])
+                    && coefficientsFinite(minusGain.eq[2])
+                    && coefficientsFinite(wideQ.eq[2])
+                    && coefficientsFinite(narrowQ.eq[2]),
+                  "extreme gain/Q coefficient snapshots stay finite for center band");
+    runner.expect(coefficientDistance(neutral.eq[2], plusGain.eq[2]) > 0.01f,
+                  "center band coefficients move measurably for +24 dB gain");
+    runner.expect(coefficientDistance(plusGain.eq[2], minusGain.eq[2]) > 0.05f,
+                  "center band coefficients move measurably between +24 dB and -24 dB");
+    runner.expect(coefficientDistance(wideQ.eq[2], narrowQ.eq[2]) > 0.01f,
+                  "center band coefficients move measurably between Q 0.3 and Q 8.0");
+
+    setParameter(processor, "hpf_enabled", 1.0f);
+    setParameter(processor, "hpf_freq", 300.0f);
+    setParameter(processor, "hpf_slope", 48.0f);
+    setParameter(processor, "lpf_enabled", 1.0f);
+    setParameter(processor, "lpf_freq", 3000.0f);
+    setParameter(processor, "lpf_slope", 48.0f);
+    settleSmoothing(processor);
+    const auto cut = processor.getTestCoefficientSnapshots();
+
+    runner.expect(cut.activeHpfStages == 4 && cut.activeLpfStages == 4,
+                  "HPF/LPF 48 dB/oct coefficient snapshots expose four active stages each");
+    bool cutFinite = true;
+    for (int stage = 0; stage < 4; ++stage)
+        cutFinite = cutFinite && coefficientsFinite(cut.hpf[(size_t) stage]) && coefficientsFinite(cut.lpf[(size_t) stage]);
+
+    runner.expect(cutFinite, "HPF/LPF extreme coefficient snapshots stay finite");
+}
+
+void testGoldenAudioReference(Runner& runner)
+{
+    const auto goldenFile = findGoldenReferenceForTests();
+    runner.expect(goldenFile.existsAsFile(), "golden audio JSON is discoverable");
+    if (! goldenFile.existsAsFile())
+        return;
+
+    GoldenAudioSignature expected;
+    runner.expect(loadGoldenAudioSignature(goldenFile, expected), "golden audio JSON parses with version 1 signature");
+    if (expected.version != 1 || expected.tapIndices.empty())
+        return;
+
+    const auto actual = renderGoldenAudioSignature();
+    runner.expect(expected.sampleRate == actual.sampleRate
+                    && expected.blockSize == actual.blockSize
+                    && expected.frames == actual.frames,
+                  "golden audio render dimensions match reference metadata");
+    runner.expect(expected.tapIndices == actual.tapIndices,
+                  "golden audio tap index list matches reference metadata");
+
+    const auto tapCount = juce::jmin(expected.leftTaps.size(), actual.leftTaps.size());
+    runner.expect(expected.leftTaps.size() == actual.leftTaps.size()
+                    && expected.rightTaps.size() == actual.rightTaps.size(),
+                  "golden audio tap counts match reference");
+
+    for (size_t i = 0; i < tapCount; ++i)
+    {
+        runner.expect(std::abs(expected.leftTaps[i] - actual.leftTaps[i]) <= 2.0e-4f,
+                      "golden audio left tap " + std::to_string(i) + " matches reference");
+        runner.expect(std::abs(expected.rightTaps[i] - actual.rightTaps[i]) <= 2.0e-4f,
+                      "golden audio right tap " + std::to_string(i) + " matches reference");
+    }
+
+    runner.expect(std::abs(expected.rmsLeft - actual.rmsLeft) <= 1.0e-4f,
+                  "golden audio left RMS matches reference");
+    runner.expect(std::abs(expected.rmsRight - actual.rmsRight) <= 1.0e-4f,
+                  "golden audio right RMS matches reference");
+    runner.expect(std::abs(expected.peak - actual.peak) <= 1.0e-4f,
+                  "golden audio peak matches reference");
+    runner.expect(std::abs(expected.trimDb - actual.trimDb) <= 0.05f,
+                  "golden audio trim dB matches reference");
+}
+
 void testRapidAutomation(Runner& runner)
 {
     MusiqueEQProcessor processor;
@@ -1061,6 +1741,168 @@ void testRapidAutomation(Runner& runner)
     }
 }
 
+void testAutomationTransient(Runner& runner)
+{
+    constexpr double sampleRate = 48000.0;
+    constexpr int blockSize = 64;
+    constexpr int numBlocks = 160;
+
+    MusiqueEQProcessor processor;
+    setParameter(processor, "mix", 100.0f);
+    setParameter(processor, "output", -9.0f);
+    setParameter(processor, "bypass", 0.0f);
+    prepare(processor, sampleRate, blockSize);
+
+    bool finite = true;
+    float peak = 0.0f;
+    float maxIntraBlockJump = 0.0f;
+    float maxBoundaryJump = 0.0f;
+    float previousLastLeft = 0.0f;
+    float previousLastRight = 0.0f;
+    bool hasPreviousBlock = false;
+    int64_t frameOffset = 0;
+
+    for (int block = 0; block < numBlocks; ++block)
+    {
+        const bool highState = (block % 2) == 0;
+        const float gainSign = highState ? 1.0f : -1.0f;
+        setParameter(processor, "low_gain", gainSign * 18.0f);
+        setParameter(processor, "low_mid_gain", -gainSign * 14.0f);
+        setParameter(processor, "mid_gain", gainSign * 20.0f);
+        setParameter(processor, "high_mid_gain", -gainSign * 16.0f);
+        setParameter(processor, "high_gain", gainSign * 12.0f);
+        setParameter(processor, "q", highState ? 7.5f : 0.35f);
+        setParameter(processor, "low_freq", highState ? 55.0f : 650.0f);
+        setParameter(processor, "low_mid_freq", highState ? 180.0f : 1400.0f);
+        setParameter(processor, "mid_freq", highState ? 450.0f : 7000.0f);
+        setParameter(processor, "high_mid_freq", highState ? 1500.0f : 12000.0f);
+        setParameter(processor, "high_freq", highState ? 5000.0f : 18000.0f);
+        setParameter(processor, "hpf_enabled", 1.0f);
+        setParameter(processor, "hpf_freq", highState ? 25.0f : 600.0f);
+        setParameter(processor, "hpf_slope", block % 3 == 0 ? 12.0f : (block % 3 == 1 ? 24.0f : 48.0f));
+        setParameter(processor, "lpf_enabled", 1.0f);
+        setParameter(processor, "lpf_freq", highState ? 18000.0f : 4000.0f);
+        setParameter(processor, "lpf_slope", block % 3 == 0 ? 48.0f : (block % 3 == 1 ? 24.0f : 12.0f));
+
+        juce::AudioBuffer<float> buffer(2, blockSize);
+        for (int sample = 0; sample < blockSize; ++sample)
+        {
+            const double t = static_cast<double>(frameOffset + sample) / sampleRate;
+            const auto left = static_cast<float>(0.012
+                * (std::sin(2.0 * pi * 110.0 * t)
+                   + 0.6 * std::sin(2.0 * pi * 1730.0 * t)
+                   + 0.25 * std::sin(2.0 * pi * 9100.0 * t)));
+            const auto right = static_cast<float>(0.012
+                * (std::sin(2.0 * pi * 220.0 * t + 0.2)
+                   + 0.5 * std::sin(2.0 * pi * 5300.0 * t)
+                   + 0.20 * std::sin(2.0 * pi * 13000.0 * t)));
+            buffer.setSample(0, sample, left);
+            buffer.setSample(1, sample, right);
+        }
+        frameOffset += blockSize;
+
+        process(processor, buffer);
+
+        finite = finite && allFinite(buffer);
+        peak = juce::jmax(peak, maxAbs(buffer));
+        maxIntraBlockJump = juce::jmax(maxIntraBlockJump, maxAdjacentDiff(buffer));
+        if (hasPreviousBlock)
+        {
+            maxBoundaryJump = juce::jmax(maxBoundaryJump, std::abs(buffer.getSample(0, 0) - previousLastLeft));
+            maxBoundaryJump = juce::jmax(maxBoundaryJump, std::abs(buffer.getSample(1, 0) - previousLastRight));
+        }
+
+        previousLastLeft = buffer.getSample(0, blockSize - 1);
+        previousLastRight = buffer.getSample(1, blockSize - 1);
+        hasPreviousBlock = true;
+    }
+
+    runner.expect(finite, "automation transient remains finite across abrupt gain/frequency/Q/HPF/LPF changes");
+    runner.expect(peak < 32.0f, "automation transient peak remains bounded (peak " + std::to_string(peak) + ")");
+    runner.expect(maxIntraBlockJump < 1.0f,
+                  "automation transient has no abnormal intra-block jump (max " + std::to_string(maxIntraBlockJump) + ")");
+    runner.expect(maxBoundaryJump < 1.0f,
+                  "automation transient has no abnormal block-boundary jump (max " + std::to_string(maxBoundaryJump) + ")");
+}
+
+void runCpuBenchmark()
+{
+    constexpr double sampleRate = 48000.0;
+    constexpr int blockSize = 256;
+    constexpr int warmupBlocks = 64;
+    constexpr int measuredBlocks = 768;
+
+    MusiqueEQProcessor processor;
+    setParameter(processor, "low_gain", 3.0f);
+    setParameter(processor, "low_mid_gain", -2.0f);
+    setParameter(processor, "mid_gain", 4.0f);
+    setParameter(processor, "high_mid_gain", -1.5f);
+    setParameter(processor, "high_gain", 2.0f);
+    setParameter(processor, "q", 1.8f);
+    setParameter(processor, "low_freq", 90.0f);
+    setParameter(processor, "low_mid_freq", 420.0f);
+    setParameter(processor, "mid_freq", 1800.0f);
+    setParameter(processor, "high_mid_freq", 6200.0f);
+    setParameter(processor, "high_freq", 12000.0f);
+    setParameter(processor, "hpf_enabled", 1.0f);
+    setParameter(processor, "hpf_freq", 45.0f);
+    setParameter(processor, "hpf_slope", 24.0f);
+    setParameter(processor, "lpf_enabled", 1.0f);
+    setParameter(processor, "lpf_freq", 17500.0f);
+    setParameter(processor, "lpf_slope", 24.0f);
+    prepare(processor, sampleRate, blockSize);
+
+    std::vector<juce::AudioBuffer<float>> measuredBuffers;
+    measuredBuffers.reserve(static_cast<size_t>(measuredBlocks));
+    for (int block = 0; block < measuredBlocks; ++block)
+    {
+        measuredBuffers.emplace_back(2, blockSize);
+        auto& blockBuffer = measuredBuffers.back();
+        const int frameOffset = block * blockSize;
+        for (int sample = 0; sample < blockSize; ++sample)
+        {
+            const double t = static_cast<double>(frameOffset + sample) / sampleRate;
+            const auto left = static_cast<float>(0.01
+                * (std::sin(2.0 * pi * 120.0 * t)
+                   + 0.8 * std::sin(2.0 * pi * 750.0 * t)
+                   + 0.6 * std::sin(2.0 * pi * 2400.0 * t)
+                   + 0.4 * std::sin(2.0 * pi * 6800.0 * t)));
+            const auto right = static_cast<float>(0.01
+                * (std::sin(2.0 * pi * 180.0 * t + 0.11)
+                   + 0.7 * std::sin(2.0 * pi * 950.0 * t)
+                   + 0.5 * std::sin(2.0 * pi * 3200.0 * t)
+                   + 0.3 * std::sin(2.0 * pi * 9100.0 * t)));
+            blockBuffer.setSample(0, sample, left);
+            blockBuffer.setSample(1, sample, right);
+        }
+    }
+
+    juce::MidiBuffer midi;
+
+    for (int i = 0; i < warmupBlocks; ++i)
+    {
+        auto warmupBuffer = makeBroadbandProbe(blockSize, sampleRate, 0.01f);
+        processor.processBlock(warmupBuffer, midi);
+    }
+
+    const auto start = std::chrono::steady_clock::now();
+    for (auto& blockBuffer : measuredBuffers)
+        processor.processBlock(blockBuffer, midi);
+    const auto end = std::chrono::steady_clock::now();
+
+    float peak = 0.0f;
+    for (const auto& blockBuffer : measuredBuffers)
+        peak = juce::jmax(peak, maxAbs(blockBuffer));
+
+    const auto elapsedNs = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+    const double nsPerSample = static_cast<double>(elapsedNs)
+        / static_cast<double>(measuredBlocks * blockSize * 2);
+    std::cout << "[BENCH] eq processBlock blocks=" << measuredBlocks
+              << " blockSize=" << blockSize
+              << " ns/sample=" << nsPerSample
+              << " peak=" << peak << '\n';
+}
+
 void testBypassTransparency(Runner& runner)
 {
     MusiqueEQProcessor processor;
@@ -1085,9 +1927,28 @@ void testBypassTransparency(Runner& runner)
 }
 } // namespace
 
-int main()
+int main(int argc, char* argv[])
 {
     juce::ScopedJuceInitialiser_GUI juceInitialiser;
+
+    if (argc == 3 && std::string(argv[1]) == "--write-eq-golden")
+    {
+        const juce::File outputFile(argv[2]);
+        if (! writeGoldenAudioReference(outputFile))
+        {
+            std::cerr << "Failed to write EQ golden reference: " << outputFile.getFullPathName() << '\n';
+            return 2;
+        }
+
+        std::cout << "[GOLDEN] wrote " << outputFile.getFullPathName() << '\n';
+        return 0;
+    }
+
+    if (argc != 1)
+    {
+        std::cerr << "Usage: MusiqueEQDSPTests [--write-eq-golden <path>]\n";
+        return 2;
+    }
 
     Runner runner;
 
@@ -1095,6 +1956,7 @@ int main()
     testGraphUiHelpers(runner);
     testPresetMigrationHelper(runner);
     testFactoryPresetBank(runner);
+    testEmbeddedFactoryPresetBank(runner);
     testNeutrality(runner);
     testMixModes(runner);
     testOutputGain(runner);
@@ -1104,8 +1966,15 @@ int main()
     testFrequencyDefaultsAndState(runner);
     testFrequencyResponseControls(runner);
     testCutFilters(runner);
+    testImpulseFftFrequencyResponse(runner);
+    testLatencyAndImpulsePosition(runner);
+    testSampleRateChangeStability(runner);
+    testExtremeCoefficientMovement(runner);
+    testGoldenAudioReference(runner);
     testRapidAutomation(runner);
+    testAutomationTransient(runner);
     testBypassTransparency(runner);
+    runCpuBenchmark();
 
     std::cout << "[SUMMARY] checks=" << runner.checks << " failures=" << runner.failures << '\n';
     return runner.failures == 0 ? 0 : 1;

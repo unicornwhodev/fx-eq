@@ -3,6 +3,8 @@
 #include "PluginEditor.h"
 #endif
 
+#include <complex>
+
 namespace
 {
     constexpr std::array<const char*, 5> kGainParamIds {{
@@ -23,6 +25,66 @@ namespace
             return 1.0f;
 
         return std::pow(10.0f, dB / 20.0f);
+    }
+
+    constexpr std::array<float, 6> kIdentityBiquad {{ 1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f }};
+
+    template <typename Filter>
+    void assignBiquad(Filter& filter, const std::array<float, 6>& coefficients)
+    {
+        *filter.coefficients = coefficients;
+    }
+
+    template <typename Filter>
+    void primeBiquadStorage(Filter& filter)
+    {
+        assignBiquad(filter, kIdentityBiquad);
+        filter.reset();
+    }
+
+    int butterworthStageCountForSlope(int slopeDbPerOct) noexcept
+    {
+        switch (slopeDbPerOct)
+        {
+            case 48: return 4;
+            case 24: return 2;
+            default: return 1;
+        }
+    }
+
+    std::array<float, 4> butterworthQValuesForSlope(int slopeDbPerOct) noexcept
+    {
+        switch (slopeDbPerOct)
+        {
+            case 48:
+                return {{ 0.5097956f, 0.6013449f, 0.8999762f, 2.5629154f }};
+            case 24:
+                return {{ 0.5411961f, 1.3065630f, 1.0f, 1.0f }};
+            default:
+                return {{ 0.7071068f, 1.0f, 1.0f, 1.0f }};
+        }
+    }
+
+    double getBiquadMagnitudeForFrequency(const std::array<float, 6>& coefficients,
+                                          double frequency,
+                                          double sampleRate) noexcept
+    {
+        const double a0 = coefficients[3];
+        if (! std::isfinite(a0) || std::abs(a0) <= 1.0e-12)
+            return 1.0;
+
+        const std::complex<double> z1 = std::exp(std::complex<double>(
+            0.0, -juce::MathConstants<double>::twoPi * frequency / sampleRate));
+        const auto z2 = z1 * z1;
+        const auto numerator = static_cast<double>(coefficients[0])
+            + static_cast<double>(coefficients[1]) * z1
+            + static_cast<double>(coefficients[2]) * z2;
+        const auto denominator = static_cast<double>(coefficients[3])
+            + static_cast<double>(coefficients[4]) * z1
+            + static_cast<double>(coefficients[5]) * z2;
+
+        const auto magnitude = std::abs(numerator / denominator);
+        return std::isfinite(magnitude) ? magnitude : 1.0;
     }
 
     void ensureParameterDefaultForLegacyState(juce::ValueTree& state, const char* paramId, const juce::var& defaultValue)
@@ -114,6 +176,7 @@ void MusiqueEQProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
 {
     preparedSampleRate = sanitizeSampleRate(sampleRate);
     currentInternalTrimDb.store(0.0f, std::memory_order_relaxed);
+    invalidateTrimCache();
 
     juce::dsp::ProcessSpec spec;
     spec.sampleRate = preparedSampleRate;
@@ -126,7 +189,10 @@ void MusiqueEQProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
         rightFilters[i].reset();
         leftFilters[i].prepare(spec);
         rightFilters[i].prepare(spec);
+        primeBiquadStorage(leftFilters[i]);
+        primeBiquadStorage(rightFilters[i]);
         gainSmoothers[(size_t) i].reset(preparedSampleRate, 0.02);
+        frequencySmoothers[(size_t) i].reset(preparedSampleRate, 0.02);
     }
 
     for (int i = 0; i < kMaxCutFilterStages; ++i)
@@ -139,9 +205,15 @@ void MusiqueEQProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
         rightHpfFilters[i].prepare(spec);
         leftLpfFilters[i].prepare(spec);
         rightLpfFilters[i].prepare(spec);
+        primeBiquadStorage(leftHpfFilters[i]);
+        primeBiquadStorage(rightHpfFilters[i]);
+        primeBiquadStorage(leftLpfFilters[i]);
+        primeBiquadStorage(rightLpfFilters[i]);
     }
 
     qSmoother.reset(preparedSampleRate, 0.02);
+    hpfFrequencySmoother.reset(preparedSampleRate, 0.02);
+    lpfFrequencySmoother.reset(preparedSampleRate, 0.02);
 
     for (size_t i = 0; i < kGainParamIds.size(); ++i)
         targetGains[i] = sanitizeGainDb(parameters.getRawParameterValue(kGainParamIds[i])->load());
@@ -153,14 +225,17 @@ void MusiqueEQProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
     for (int i = 0; i < kNumBands; ++i)
     {
         gainSmoothers[(size_t) i].setCurrentAndTargetValue(targetGains[(size_t) i]);
+        frequencySmoothers[(size_t) i].setCurrentAndTargetValue(targetFrequencies[(size_t) i]);
         appliedGains[(size_t) i] = targetGains[(size_t) i];
         appliedFrequencies[(size_t) i] = targetFrequencies[(size_t) i];
     }
 
-    appliedCutFilters = targetCutFilters;
     qSmoother.setCurrentAndTargetValue(targetQ);
+    hpfFrequencySmoother.setCurrentAndTargetValue(targetCutFilters.hpfFrequency);
+    lpfFrequencySmoother.setCurrentAndTargetValue(targetCutFilters.lpfFrequency);
     appliedQ = targetQ;
 
+    appliedCutFilters = targetCutFilters;
     updateFilterCoefficients(appliedGains, appliedQ, appliedFrequencies);
     updateCutFilterCoefficients(appliedCutFilters);
 }
@@ -183,6 +258,7 @@ void MusiqueEQProcessor::releaseResources()
 
     activeHpfStages = 0;
     activeLpfStages = 0;
+    invalidateTrimCache();
     currentInternalTrimDb.store(0.0f, std::memory_order_relaxed);
 }
 
@@ -196,42 +272,57 @@ void MusiqueEQProcessor::updateFilterCoefficients(const std::array<float, kNumBa
                                                   float qValue,
                                                   const std::array<float, kNumBands>& bandFrequencies)
 {
-    using Coeffs = juce::dsp::IIR::Coefficients<float>;
+    using Coeffs = juce::dsp::IIR::ArrayCoefficients<float>;
 
     const double safeSampleRate = sanitizeSampleRate(preparedSampleRate);
     const auto safeGains = sanitizeBandGains(bandGains);
     const auto bandFreqs = getBandFrequencies(bandFrequencies, safeSampleRate);
     const float safeQ = sanitizeQ(qValue);
 
-    auto low     = Coeffs::makeLowShelf (safeSampleRate, static_cast<float>(bandFreqs[0]), safeQ, dbToGain(safeGains[0]));
-    auto lowMid  = Coeffs::makePeakFilter(safeSampleRate, static_cast<float>(bandFreqs[1]), safeQ, dbToGain(safeGains[1]));
-    auto mid     = Coeffs::makePeakFilter(safeSampleRate, static_cast<float>(bandFreqs[2]), safeQ, dbToGain(safeGains[2]));
-    auto highMid = Coeffs::makePeakFilter(safeSampleRate, static_cast<float>(bandFreqs[3]), safeQ, dbToGain(safeGains[3]));
-    auto high    = Coeffs::makeHighShelf(safeSampleRate, static_cast<float>(bandFreqs[4]), safeQ, dbToGain(safeGains[4]));
+    const std::array<std::array<float, 6>, kNumBands> coefficients {{
+        Coeffs::makeLowShelf (safeSampleRate, static_cast<float>(bandFreqs[0]), safeQ, dbToGain(safeGains[0])),
+        Coeffs::makePeakFilter(safeSampleRate, static_cast<float>(bandFreqs[1]), safeQ, dbToGain(safeGains[1])),
+        Coeffs::makePeakFilter(safeSampleRate, static_cast<float>(bandFreqs[2]), safeQ, dbToGain(safeGains[2])),
+        Coeffs::makePeakFilter(safeSampleRate, static_cast<float>(bandFreqs[3]), safeQ, dbToGain(safeGains[3])),
+        Coeffs::makeHighShelf(safeSampleRate, static_cast<float>(bandFreqs[4]), safeQ, dbToGain(safeGains[4]))
+    }};
 
-    *leftFilters[0].coefficients  = *low;
-    *leftFilters[1].coefficients  = *lowMid;
-    *leftFilters[2].coefficients  = *mid;
-    *leftFilters[3].coefficients  = *highMid;
-    *leftFilters[4].coefficients  = *high;
+    for (int i = 0; i < kNumBands; ++i)
+    {
+        assignBiquad(leftFilters[i], coefficients[(size_t) i]);
+        assignBiquad(rightFilters[i], coefficients[(size_t) i]);
+    }
 
-    *rightFilters[0].coefficients = *low;
-    *rightFilters[1].coefficients = *lowMid;
-    *rightFilters[2].coefficients = *mid;
-    *rightFilters[3].coefficients = *highMid;
-    *rightFilters[4].coefficients = *high;
+    invalidateTrimCache();
 }
 
 void MusiqueEQProcessor::updateCutFilterCoefficients(const CutFilterSettings& settings)
 {
+    using Coeffs = juce::dsp::IIR::ArrayCoefficients<float>;
+
     const double safeSampleRate = sanitizeSampleRate(preparedSampleRate);
-    const auto applyDesignedFilters = [](auto& left, auto& right, const auto& designed)
+    const auto previous = appliedCutFilters;
+    const bool shouldResetHpf = settings.hpfEnabled != previous.hpfEnabled
+        || (settings.hpfEnabled && settings.hpfSlopeDbPerOct != previous.hpfSlopeDbPerOct);
+    const bool shouldResetLpf = settings.lpfEnabled != previous.lpfEnabled
+        || (settings.lpfEnabled && settings.lpfSlopeDbPerOct != previous.lpfSlopeDbPerOct);
+
+    const auto applyCutFilters = [safeSampleRate](auto& left,
+                                                  auto& right,
+                                                  bool highPass,
+                                                  float frequency,
+                                                  int slopeDbPerOct)
     {
-        const int numStages = juce::jmin(static_cast<int>(designed.size()), kMaxCutFilterStages);
+        const auto qValues = butterworthQValuesForSlope(slopeDbPerOct);
+        const int numStages = butterworthStageCountForSlope(slopeDbPerOct);
+
         for (int i = 0; i < numStages; ++i)
         {
-            *left[i].coefficients = *designed.getUnchecked(i);
-            *right[i].coefficients = *designed.getUnchecked(i);
+            const auto coefficients = highPass
+                ? Coeffs::makeHighPass(safeSampleRate, frequency, qValues[(size_t) i])
+                : Coeffs::makeLowPass(safeSampleRate, frequency, qValues[(size_t) i]);
+            assignBiquad(left[i], coefficients);
+            assignBiquad(right[i], coefficients);
         }
 
         return numStages;
@@ -239,11 +330,11 @@ void MusiqueEQProcessor::updateCutFilterCoefficients(const CutFilterSettings& se
 
     if (settings.hpfEnabled)
     {
-        const auto designed = juce::dsp::FilterDesign<float>::designIIRHighpassHighOrderButterworthMethod(
-            sanitizeCutFrequency(settings.hpfFrequency, safeSampleRate, 30.0f),
-            safeSampleRate,
-            slopeDbPerOctToOrder(settings.hpfSlopeDbPerOct));
-        activeHpfStages = applyDesignedFilters(leftHpfFilters, rightHpfFilters, designed);
+        activeHpfStages = applyCutFilters(leftHpfFilters,
+                                          rightHpfFilters,
+                                          true,
+                                          sanitizeCutFrequency(settings.hpfFrequency, safeSampleRate, 30.0f),
+                                          settings.hpfSlopeDbPerOct);
     }
     else
     {
@@ -252,28 +343,41 @@ void MusiqueEQProcessor::updateCutFilterCoefficients(const CutFilterSettings& se
 
     if (settings.lpfEnabled)
     {
-        const auto designed = juce::dsp::FilterDesign<float>::designIIRLowpassHighOrderButterworthMethod(
-            sanitizeCutFrequency(settings.lpfFrequency, safeSampleRate, 18000.0f),
-            safeSampleRate,
-            slopeDbPerOctToOrder(settings.lpfSlopeDbPerOct));
-        activeLpfStages = applyDesignedFilters(leftLpfFilters, rightLpfFilters, designed);
+        activeLpfStages = applyCutFilters(leftLpfFilters,
+                                          rightLpfFilters,
+                                          false,
+                                          sanitizeCutFrequency(settings.lpfFrequency, safeSampleRate, 18000.0f),
+                                          settings.lpfSlopeDbPerOct);
     }
     else
     {
         activeLpfStages = 0;
     }
 
-    for (int i = 0; i < kMaxCutFilterStages; ++i)
+    if (shouldResetHpf)
     {
-        leftHpfFilters[i].reset();
-        rightHpfFilters[i].reset();
-        leftLpfFilters[i].reset();
-        rightLpfFilters[i].reset();
+        for (int i = 0; i < kMaxCutFilterStages; ++i)
+        {
+            leftHpfFilters[i].reset();
+            rightHpfFilters[i].reset();
+        }
     }
+
+    if (shouldResetLpf)
+    {
+        for (int i = 0; i < kMaxCutFilterStages; ++i)
+        {
+            leftLpfFilters[i].reset();
+            rightLpfFilters[i].reset();
+        }
+    }
+
+    appliedCutFilters = settings;
 }
 
-bool MusiqueEQProcessor::refreshSmoothedTargets()
+MusiqueEQProcessor::TargetChangeFlags MusiqueEQProcessor::refreshSmoothedTargets()
 {
+    TargetChangeFlags changes {};
     std::array<float, kNumBands> newTargets {};
     for (size_t i = 0; i < kGainParamIds.size(); ++i)
         newTargets[i] = sanitizeGainDb(parameters.getRawParameterValue(kGainParamIds[i])->load());
@@ -282,20 +386,20 @@ bool MusiqueEQProcessor::refreshSmoothedTargets()
     const auto newCutFilters = readCutFilterSettingsFromParameters();
     const float newQ = sanitizeQ(parameters.getRawParameterValue("q")->load());
 
-    bool changed = false;
     for (int i = 0; i < kNumBands; ++i)
     {
         if (! juce::approximatelyEqual(targetGains[(size_t) i], newTargets[(size_t) i]))
         {
             targetGains[(size_t) i] = newTargets[(size_t) i];
             gainSmoothers[(size_t) i].setTargetValue(newTargets[(size_t) i]);
-            changed = true;
+            changes.eqChanged = true;
         }
 
         if (! juce::approximatelyEqual(targetFrequencies[(size_t) i], newFrequencies[(size_t) i]))
         {
             targetFrequencies[(size_t) i] = newFrequencies[(size_t) i];
-            changed = true;
+            frequencySmoothers[(size_t) i].setTargetValue(newFrequencies[(size_t) i]);
+            changes.eqChanged = true;
         }
     }
 
@@ -303,16 +407,22 @@ bool MusiqueEQProcessor::refreshSmoothedTargets()
     {
         targetQ = newQ;
         qSmoother.setTargetValue(newQ);
-        changed = true;
+        changes.eqChanged = true;
     }
 
     if (! cutFilterSettingsEqual(targetCutFilters, newCutFilters))
     {
+        if (! juce::approximatelyEqual(targetCutFilters.hpfFrequency, newCutFilters.hpfFrequency))
+            hpfFrequencySmoother.setTargetValue(newCutFilters.hpfFrequency);
+
+        if (! juce::approximatelyEqual(targetCutFilters.lpfFrequency, newCutFilters.lpfFrequency))
+            lpfFrequencySmoother.setTargetValue(newCutFilters.lpfFrequency);
+
         targetCutFilters = newCutFilters;
-        changed = true;
+        changes.cutChanged = true;
     }
 
-    return changed;
+    return changes;
 }
 
 std::array<float, MusiqueEQProcessor::kNumBands> MusiqueEQProcessor::readBandFrequenciesFromParameters() const noexcept
@@ -404,11 +514,6 @@ int MusiqueEQProcessor::sanitizeSlopeDbPerOct(float slopeDbPerOct) noexcept
     return 48;
 }
 
-int MusiqueEQProcessor::slopeDbPerOctToOrder(int slopeDbPerOct) noexcept
-{
-    return juce::jlimit(2, 8, sanitizeSlopeDbPerOct(static_cast<float>(slopeDbPerOct)) / 6);
-}
-
 bool MusiqueEQProcessor::cutFilterSettingsEqual(const CutFilterSettings& a, const CutFilterSettings& b) noexcept
 {
     return a.hpfEnabled == b.hpfEnabled
@@ -417,6 +522,15 @@ bool MusiqueEQProcessor::cutFilterSettingsEqual(const CutFilterSettings& a, cons
         && a.lpfEnabled == b.lpfEnabled
         && juce::approximatelyEqual(a.lpfFrequency, b.lpfFrequency)
         && a.lpfSlopeDbPerOct == b.lpfSlopeDbPerOct;
+}
+
+bool MusiqueEQProcessor::bandFloatArraysEqual(const std::array<float, kNumBands>& a,
+                                              const std::array<float, kNumBands>& b) noexcept
+{
+    return std::equal(a.begin(), a.end(), b.begin(), [](float left, float right)
+    {
+        return juce::approximatelyEqual(left, right);
+    });
 }
 
 std::array<float, MusiqueEQProcessor::kNumBands> MusiqueEQProcessor::sanitizeBandGains(const std::array<float, kNumBands>& bandGains) noexcept
@@ -467,23 +581,51 @@ std::array<double, MusiqueEQProcessor::kNumBands> MusiqueEQProcessor::getBandFre
     };
 }
 
+void MusiqueEQProcessor::invalidateTrimCache() noexcept
+{
+    trimCache.valid = false;
+}
+
+float MusiqueEQProcessor::getCachedInternalTrimDb() noexcept
+{
+    const double safeSampleRate = sanitizeSampleRate(preparedSampleRate);
+
+    if (! trimCache.valid
+        || ! bandFloatArraysEqual(trimCache.bandGains, appliedGains)
+        || ! bandFloatArraysEqual(trimCache.bandFrequencies, appliedFrequencies)
+        || ! juce::approximatelyEqual(trimCache.qValue, appliedQ)
+        || ! juce::approximatelyEqual(trimCache.sampleRate, safeSampleRate))
+    {
+        trimCache.bandGains = appliedGains;
+        trimCache.bandFrequencies = appliedFrequencies;
+        trimCache.qValue = appliedQ;
+        trimCache.sampleRate = safeSampleRate;
+        trimCache.trimDb = computeInternalTrimDb(appliedGains, appliedQ, appliedFrequencies, safeSampleRate);
+        trimCache.valid = true;
+    }
+
+    return trimCache.trimDb;
+}
+
 float MusiqueEQProcessor::computeInternalTrimDb(const std::array<float, kNumBands>& bandGains,
                                                 float qValue,
                                                 const std::array<float, kNumBands>& bandFrequencies,
                                                 double sampleRate) noexcept
 {
-    using Coeffs = juce::dsp::IIR::Coefficients<float>;
+    using Coeffs = juce::dsp::IIR::ArrayCoefficients<float>;
 
     const double safeSampleRate = sanitizeSampleRate(sampleRate);
     const auto safeGains = sanitizeBandGains(bandGains);
     const auto bandFreqs = getBandFrequencies(bandFrequencies, safeSampleRate);
     const float safeQ = sanitizeQ(qValue);
 
-    const auto low     = Coeffs::makeLowShelf (safeSampleRate, static_cast<float>(bandFreqs[0]), safeQ, dbToGain(safeGains[0]));
-    const auto lowMid  = Coeffs::makePeakFilter(safeSampleRate, static_cast<float>(bandFreqs[1]), safeQ, dbToGain(safeGains[1]));
-    const auto mid     = Coeffs::makePeakFilter(safeSampleRate, static_cast<float>(bandFreqs[2]), safeQ, dbToGain(safeGains[2]));
-    const auto highMid = Coeffs::makePeakFilter(safeSampleRate, static_cast<float>(bandFreqs[3]), safeQ, dbToGain(safeGains[3]));
-    const auto high    = Coeffs::makeHighShelf(safeSampleRate, static_cast<float>(bandFreqs[4]), safeQ, dbToGain(safeGains[4]));
+    const std::array<std::array<float, 6>, kNumBands> coefficients {{
+        Coeffs::makeLowShelf (safeSampleRate, static_cast<float>(bandFreqs[0]), safeQ, dbToGain(safeGains[0])),
+        Coeffs::makePeakFilter(safeSampleRate, static_cast<float>(bandFreqs[1]), safeQ, dbToGain(safeGains[1])),
+        Coeffs::makePeakFilter(safeSampleRate, static_cast<float>(bandFreqs[2]), safeQ, dbToGain(safeGains[2])),
+        Coeffs::makePeakFilter(safeSampleRate, static_cast<float>(bandFreqs[3]), safeQ, dbToGain(safeGains[3])),
+        Coeffs::makeHighShelf(safeSampleRate, static_cast<float>(bandFreqs[4]), safeQ, dbToGain(safeGains[4]))
+    }};
 
     constexpr int numProbePoints = 96;
     constexpr double minFrequency = 20.0;
@@ -496,11 +638,9 @@ float MusiqueEQProcessor::computeInternalTrimDb(const std::array<float, kNumBand
     {
         const double normalised = numProbePoints == 1 ? 0.0 : static_cast<double>(i) / static_cast<double>(numProbePoints - 1);
         const double frequency = std::exp(logMin + (logMax - logMin) * normalised);
-        const double magnitude = low->getMagnitudeForFrequency(frequency, safeSampleRate)
-            * lowMid->getMagnitudeForFrequency(frequency, safeSampleRate)
-            * mid->getMagnitudeForFrequency(frequency, safeSampleRate)
-            * highMid->getMagnitudeForFrequency(frequency, safeSampleRate)
-            * high->getMagnitudeForFrequency(frequency, safeSampleRate);
+        double magnitude = 1.0;
+        for (const auto& biquad : coefficients)
+            magnitude *= getBiquadMagnitudeForFrequency(biquad, frequency, safeSampleRate);
 
         if (std::isfinite(magnitude))
             peakMagnitude = juce::jmax(peakMagnitude, magnitude);
@@ -542,10 +682,14 @@ void MusiqueEQProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mi
         }
     }
 
-    const bool targetChanged = refreshSmoothedTargets();
-    const bool smoothingActive = targetChanged
+    const auto targetChanges = refreshSmoothedTargets();
+    const bool eqSmoothingActive = targetChanges.eqChanged
         || qSmoother.isSmoothing()
-        || std::any_of(gainSmoothers.begin(), gainSmoothers.end(), [](auto& smoother) { return smoother.isSmoothing(); });
+        || std::any_of(gainSmoothers.begin(), gainSmoothers.end(), [](auto& smoother) { return smoother.isSmoothing(); })
+        || std::any_of(frequencySmoothers.begin(), frequencySmoothers.end(), [](auto& smoother) { return smoother.isSmoothing(); });
+    const bool cutSmoothingActive = targetChanges.cutChanged
+        || hpfFrequencySmoother.isSmoothing()
+        || lpfFrequencySmoother.isSmoothing();
 
     if (mix <= 0.0001f)
     {
@@ -555,17 +699,29 @@ void MusiqueEQProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mi
         return;
     }
 
-    if (! cutFilterSettingsEqual(appliedCutFilters, targetCutFilters))
+    const auto updateCutFiltersIfNeeded = [this](const CutFilterSettings& settings)
     {
-        appliedCutFilters = targetCutFilters;
-        updateCutFilterCoefficients(appliedCutFilters);
-    }
+        if (! cutFilterSettingsEqual(appliedCutFilters, settings))
+            updateCutFilterCoefficients(settings);
+    };
 
-    if (! smoothingActive)
+    const auto nextCutSettings = [this]()
+    {
+        auto settings = targetCutFilters;
+        settings.hpfFrequency = hpfFrequencySmoother.isSmoothing()
+            ? hpfFrequencySmoother.getNextValue()
+            : targetCutFilters.hpfFrequency;
+        settings.lpfFrequency = lpfFrequencySmoother.isSmoothing()
+            ? lpfFrequencySmoother.getNextValue()
+            : targetCutFilters.lpfFrequency;
+        return settings;
+    };
+
+    if (! eqSmoothingActive && ! cutSmoothingActive)
     {
         if (! juce::approximatelyEqual(appliedQ, targetQ)
-            || ! std::equal(appliedGains.begin(), appliedGains.end(), targetGains.begin(), [](float a, float b) { return juce::approximatelyEqual(a, b); })
-            || ! std::equal(appliedFrequencies.begin(), appliedFrequencies.end(), targetFrequencies.begin(), [](float a, float b) { return juce::approximatelyEqual(a, b); }))
+            || ! bandFloatArraysEqual(appliedGains, targetGains)
+            || ! bandFloatArraysEqual(appliedFrequencies, targetFrequencies))
         {
             appliedQ = targetQ;
             appliedGains = targetGains;
@@ -573,7 +729,9 @@ void MusiqueEQProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mi
             updateFilterCoefficients(appliedGains, appliedQ, appliedFrequencies);
         }
 
-        const float internalTrimDb = computeInternalTrimDb(appliedGains, appliedQ, appliedFrequencies, preparedSampleRate);
+        updateCutFiltersIfNeeded(targetCutFilters);
+
+        const float internalTrimDb = getCachedInternalTrimDb();
         const float internalTrimGain = dbToGain(-internalTrimDb);
         currentInternalTrimDb.store(internalTrimDb, std::memory_order_relaxed);
 
@@ -616,12 +774,22 @@ void MusiqueEQProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mi
         while (sampleIndex < numSamples)
         {
             const int chunkEnd = juce::jmin(numSamples, sampleIndex + smoothingChunkSize);
-            for (int i = 0; i < kNumBands; ++i)
-                appliedGains[(size_t) i] = gainSmoothers[(size_t) i].getNextValue();
-            appliedQ = qSmoother.getNextValue();
-            appliedFrequencies = targetFrequencies;
-            updateFilterCoefficients(appliedGains, appliedQ, appliedFrequencies);
-            const float internalTrimDb = computeInternalTrimDb(appliedGains, appliedQ, appliedFrequencies, preparedSampleRate);
+            if (eqSmoothingActive)
+            {
+                for (int i = 0; i < kNumBands; ++i)
+                {
+                    appliedGains[(size_t) i] = gainSmoothers[(size_t) i].getNextValue();
+                    appliedFrequencies[(size_t) i] = frequencySmoothers[(size_t) i].getNextValue();
+                }
+
+                appliedQ = qSmoother.getNextValue();
+                updateFilterCoefficients(appliedGains, appliedQ, appliedFrequencies);
+            }
+
+            if (cutSmoothingActive)
+                updateCutFiltersIfNeeded(nextCutSettings());
+
+            const float internalTrimDb = getCachedInternalTrimDb();
             const float internalTrimGain = dbToGain(-internalTrimDb);
             currentInternalTrimDb.store(internalTrimDb, std::memory_order_relaxed);
 
@@ -681,6 +849,49 @@ void MusiqueEQProcessor::setStateInformation(const void* data, int sizeInBytes)
         parameters.replaceState(restoredState);
     }
 }
+
+#if MUSIQUE_EQ_DSP_TESTS
+namespace
+{
+    MusiqueEQProcessor::TestBiquadCoefficients snapshotBiquadForTests(
+        const juce::dsp::IIR::Filter<float>& filter)
+    {
+        MusiqueEQProcessor::TestBiquadCoefficients out {{ 1.0f, 0.0f, 0.0f, 0.0f, 0.0f }};
+
+        if (filter.coefficients == nullptr)
+            return out;
+
+        const auto* raw = filter.coefficients->getRawCoefficients();
+        if (raw == nullptr)
+            return out;
+
+        const auto order = filter.coefficients->getFilterOrder();
+        const auto count = juce::jlimit<size_t>(0, out.size(), static_cast<size_t>(order * 2 + 1));
+        for (size_t i = 0; i < count; ++i)
+            out[i] = raw[i];
+
+        return out;
+    }
+}
+
+MusiqueEQProcessor::TestCoefficientSnapshots MusiqueEQProcessor::getTestCoefficientSnapshots() const
+{
+    TestCoefficientSnapshots snapshots {};
+
+    for (int i = 0; i < kNumBands; ++i)
+        snapshots.eq[(size_t) i] = snapshotBiquadForTests(leftFilters[i]);
+
+    for (int i = 0; i < kMaxCutFilterStages; ++i)
+    {
+        snapshots.hpf[(size_t) i] = snapshotBiquadForTests(leftHpfFilters[i]);
+        snapshots.lpf[(size_t) i] = snapshotBiquadForTests(leftLpfFilters[i]);
+    }
+
+    snapshots.activeHpfStages = activeHpfStages;
+    snapshots.activeLpfStages = activeLpfStages;
+    return snapshots;
+}
+#endif
 
 juce::AudioProcessorEditor* MusiqueEQProcessor::createEditor()
 {

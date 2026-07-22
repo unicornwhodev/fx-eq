@@ -39,6 +39,28 @@ namespace
         fx::preset::applyToAPVTS(proc.getAPVTS(), musique::eq::presets::migratePresetForCurrentParameters(preset));
     }
 
+    juce::Array<juce::var> loadEmbeddedFactoryPresets()
+    {
+        juce::Array<juce::var> out;
+        const auto jsonText = juce::String::fromUTF8(
+            reinterpret_cast<const char*>(BinaryData::factory_bank_json),
+            BinaryData::factory_bank_jsonSize);
+
+        const auto parsed = juce::JSON::parse(jsonText);
+        if (auto* bank = parsed.getDynamicObject())
+            if (auto* presetArray = bank->getProperty("presets").getArray())
+                out.addArray(*presetArray);
+
+        return out;
+    }
+
+    juce::Array<juce::var> loadEQPresets()
+    {
+        auto out = loadEmbeddedFactoryPresets();
+        out.addArray(fx::preset::loadUserPresets("fx-eq"));
+        return out;
+    }
+
     float readGraphFrequency(juce::AudioProcessorValueTreeState& apvts,
                              const char* id,
                              float fallback,
@@ -126,19 +148,16 @@ MusiqueEQEditor::MusiqueEQEditor(MusiqueEQProcessor& p)
     setupHdrBtn(bypassBtn, true);
     setupHdrBtn(monoBtn, true);
     setupHdrBtn(headroomBtn);
-    setupHdrBtn(settingsBtn);
-    fx::ui::markUnsupportedControl(settingsBtn);
     headroomBtn.setTooltip("Shows the internal safety trim applied before the EQ stages when boosts and Q become aggressive");
     headroomBtn.onClick = [] {};
 
     // Preset bar
-    setupHdrBtn(prevBtn); setupHdrBtn(nextBtn); setupHdrBtn(saveBtn); setupHdrBtn(abBtn);
-    fx::ui::markUnsupportedControl(abBtn);
+    setupHdrBtn(prevBtn); setupHdrBtn(nextBtn); setupHdrBtn(saveBtn);
     addAndMakeVisible(presetBox);
     presetBox.setTextWhenNothingSelected("Manual State");
     presetBox.setTextWhenNoChoicesAvailable("Manual State");
 
-    presets = std::make_shared<juce::Array<juce::var>>(fx::preset::loadAllPresets("fx-eq"));
+    presets = std::make_shared<juce::Array<juce::var>>(loadEQPresets());
     if (! presets->isEmpty())
     {
         int id = 1;
@@ -169,7 +188,7 @@ MusiqueEQEditor::MusiqueEQEditor(MusiqueEQProcessor& p)
                                "hpf_enabled","hpf_freq","hpf_slope","lpf_enabled","lpf_freq","lpf_slope"};
         if (fx::preset::saveUserPreset("fx-eq", name, ids, proc.getAPVTS()))
         {
-            *presets = fx::preset::loadAllPresets("fx-eq");
+            *presets = loadEQPresets();
             presetBox.clear();
             presetBox.setTextWhenNothingSelected("Manual State");
             presetBox.setTextWhenNoChoicesAvailable("Manual State");
@@ -876,18 +895,16 @@ void MusiqueEQEditor::resized()
 {
     // Header
     titleLabel.setBounds(56, 10, 160, 40);
-    bypassBtn.setBounds(getWidth() - 310, 16, 64, fx::dim::btnH);
-    monoBtn.setBounds(getWidth() - 254, 16, 96, fx::dim::btnH);
-    headroomBtn.setBounds(getWidth() - 166, 16, 82, fx::dim::btnH);
-    settingsBtn.setBounds(getWidth() - 64, 16, 42, fx::dim::btnH);
+    bypassBtn.setBounds(getWidth() - 280, 16, 64, fx::dim::btnH);
+    monoBtn.setBounds(getWidth() - 208, 16, 96, fx::dim::btnH);
+    headroomBtn.setBounds(getWidth() - 104, 16, 82, fx::dim::btnH);
 
     // Preset bar
     const int py = fx::dim::headerH + 11;
     prevBtn.setBounds(260, py, 30, fx::dim::btnH);
-    presetBox.setBounds(294, py, 250, fx::dim::btnH);
-    nextBtn.setBounds(548, py, 30, fx::dim::btnH);
-    saveBtn.setBounds(590, py, 56, fx::dim::btnH);
-    abBtn.setBounds(652, py, 48, fx::dim::btnH);
+    presetBox.setBounds(294, py, 300, fx::dim::btnH);
+    nextBtn.setBounds(598, py, 30, fx::dim::btnH);
+    saveBtn.setBounds(640, py, 56, fx::dim::btnH);
 
     // Knobs
     const int ctrlTop = fx::dim::headerH + fx::dim::presetBarH + fx::dim::visualH;
