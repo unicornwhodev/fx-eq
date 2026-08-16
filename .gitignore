@@ -1,7 +1,7 @@
-# CMake build trees
 build/
 build-*/
 build_*/
+JUCE/
 CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
@@ -13,15 +13,12 @@ _deps/
 .ninja_*
 Makefile
 install_manifest.txt
-
-# Generated binaries and IDE files
 *_artefacts/
 JuceLibraryCode/
 *.sln
 *.vcxproj
 *.vcxproj.filters
 *.vcxproj.user
-*.dir/
 *.obj
 *.pdb
 *.ilk
@@ -36,3 +33,6 @@ JuceLibraryCode/
 *.app
 *.exe
 *.log
+release/
+installer/output/
+installer/staging/
