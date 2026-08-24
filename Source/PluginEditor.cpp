@@ -54,10 +54,34 @@ namespace
         return out;
     }
 
+    juce::Array<juce::var> loadUserEQPresets()
+    {
+        juce::Array<juce::var> out;
+        const auto directory = fx::preset::userPresetFolder("fx-eq");
+
+        if (! directory.isDirectory())
+            return out;
+
+        for (auto& presetFile : directory.findChildFiles(juce::File::findFiles, false, "*.json"))
+        {
+            auto preset = juce::JSON::parse(presetFile.loadFileAsString());
+
+            if (auto* object = preset.getDynamicObject())
+            {
+                if (object->getProperty("name").toString().isEmpty())
+                    object->setProperty("name", presetFile.getFileNameWithoutExtension());
+
+                out.add(preset);
+            }
+        }
+
+        return out;
+    }
+
     juce::Array<juce::var> loadEQPresets()
     {
         auto out = loadEmbeddedFactoryPresets();
-        out.addArray(fx::preset::loadUserPresets("fx-eq"));
+        out.addArray(loadUserEQPresets());
         return out;
     }
 
