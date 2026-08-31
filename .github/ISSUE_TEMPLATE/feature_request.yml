@@ -1,0 +1,27 @@
+name: Feature request
+description: Suggest an improvement to the official plug-in
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: Describe the musical workflow or problem first. Code submissions and modified builds are not accepted.
+  - type: textarea
+    id: need
+    attributes:
+      label: What would this improve?
+      description: Explain the production or sound-design workflow that is currently difficult.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Suggested behavior
+      description: Describe the result and controls from a user's point of view.
+    validations:
+      required: true
+  - type: input
+    id: host
+    attributes:
+      label: DAW or Standalone context
+      placeholder: FL Studio, Ableton Live, Standalone…

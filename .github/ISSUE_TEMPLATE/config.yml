@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Commercial license
+    url: https://unicorsoundengine.com/en/contact
+    about: Request a paid written license for professional use above the revenue threshold.
+  - name: License terms
+    url: https://unicorsoundengine.com/en/license
+    about: Read the UWdeVST Proprietary Public-Source License v1.0.

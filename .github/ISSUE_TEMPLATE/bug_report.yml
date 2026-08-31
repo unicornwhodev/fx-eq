@@ -1,0 +1,40 @@
+name: Bug report
+description: Report a reproducible problem in the official plug-in
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for helping improve UWdeVST. Do not attach modified binaries or third-party copyrighted material.
+  - type: input
+    id: version
+    attributes:
+      label: Plug-in version
+      placeholder: v1.0.0
+    validations:
+      required: true
+  - type: input
+    id: host
+    attributes:
+      label: Host and Windows version
+      placeholder: FL Studio 2025, Windows 11 x64
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: List the shortest reliable sequence that triggers the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and actual result
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Add logs, screenshots or project details that do not contain private data.
